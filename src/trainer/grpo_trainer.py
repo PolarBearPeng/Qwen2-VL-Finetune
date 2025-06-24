@@ -12,7 +12,6 @@ from datasets import Dataset, IterableDataset
 from packaging import version
 import transformers
 import textwrap
-import safetensors
 
 from torch.utils.data import DataLoader, Sampler
 
@@ -21,12 +20,8 @@ from transformers.utils import is_peft_available, is_datasets_available
 
 from transformers.trainer import (
     is_peft_available,
-    WEIGHTS_NAME,
-    TRAINING_ARGS_NAME,
-    SAFE_WEIGHTS_NAME,
     TRAINER_STATE_NAME,
     PREFIX_CHECKPOINT_DIR,
-    logger,
 )
 
 from transformers.trainer_utils import seed_worker
@@ -752,29 +747,24 @@ class QwenGRPOTrainer(Trainer):
     # Get the per-token log probabilities for the completions for the model and the reference model
     @profiling_decorator
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep, batch_size=None, **multimodal_inputs) -> torch.Tensor:
-        batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
-        all_logps = []
-        for i in range(0, input_ids.size(0), batch_size):
-            input_ids_batch = input_ids[i : i + batch_size]
-            attention_mask_batch = attention_mask[i : i + batch_size]
 
-            # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
-            logits = model(
-                input_ids=input_ids_batch, attention_mask=attention_mask_batch, **multimodal_inputs
-            ).logits
-            logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
-            # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
-            # See https://github.com/huggingface/trl/issues/2770
-            # VLMs dosen't have a `logits_to_keep` argument, so we handle it manually.
-            if logits_to_keep is not None:
-                logits = logits[:, -logits_to_keep:]
-                input_ids_batch = input_ids_batch[:, -logits_to_keep:]
-            # Divide logits by sampling temperature.
-            # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-            logits = logits / self.temperature
-            logps = selective_log_softmax(logits, input_ids_batch)  # compute logprobs for the input tokens
-            all_logps.append(logps)
-        return torch.cat(all_logps, dim=0)
+        logits = model(
+            input_ids=input_ids, attention_mask=attention_mask, **multimodal_inputs
+        ).logits
+        logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
+        input_ids = input_ids[:, 1:]
+        # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
+        # See https://github.com/huggingface/trl/issues/2770
+        # VLMs dosen't have a `logits_to_keep` argument, so we handle it manually.
+        if logits_to_keep is not None:
+            logits = logits[:, -logits_to_keep:]
+            input_ids = input_ids[:, -logits_to_keep:]
+        # Divide logits by sampling temperature.
+        # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
+        logits = logits / self.temperature
+        logps = selective_log_softmax(logits, input_ids)  # compute logprobs for the input tokens
+
+        return logps
 
     @profiling_decorator
     def _move_model_to_vllm(self):
@@ -1276,45 +1266,6 @@ class QwenGRPOTrainer(Trainer):
 
         else:
             super(QwenGRPOTrainer, self)._save_checkpoint(model, trial)
-
-    def _save(self, output_dir: Optional[str] = None, state_dict=None):
-            # If we are executing this function, we are the process zero, so we don't check for that.
-            output_dir = output_dir if output_dir is not None else self.args.output_dir
-            os.makedirs(output_dir, exist_ok=True)
-            logger.info(f"Saving model checkpoint to {output_dir}")
-
-            supported_classes = (PreTrainedModel,) if not is_peft_available() else (PreTrainedModel, PeftModel)
-            # Save a trained model and configuration using `save_pretrained()`.
-            # They can then be reloaded using `from_pretrained()`
-            if not isinstance(self.model, supported_classes):
-                if state_dict is None:
-                    state_dict = self.model.state_dict()
-
-                if isinstance(self.accelerator.unwrap_model(self.model), supported_classes):
-                    self.accelerator.unwrap_model(self.model).save_pretrained(
-                        output_dir, state_dict=state_dict, safe_serialization=self.args.save_safetensors
-                    )
-                else:
-                    logger.info("Trainer.model is not a `PreTrainedModel`, only saving its state dict.")
-                    if self.args.save_safetensors:
-                        safetensors.torch.save_file(
-                            state_dict, os.path.join(output_dir, SAFE_WEIGHTS_NAME), metadata={"format": "pt"}
-                        )
-                    else:
-                        torch.save(state_dict, os.path.join(output_dir, WEIGHTS_NAME))
-            else:
-                self.model.save_pretrained(
-                    output_dir, state_dict=state_dict, safe_serialization=self.args.save_safetensors
-                )
-
-            if self.tokenizer is not None:
-                self.tokenizer.save_pretrained(output_dir)
-
-            if self.processing_class is not None:
-                self.processing_class.save_pretrained(output_dir)
-
-            # Good practice: save your training arguments together with the trained model
-            torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
 
     def create_model_card(
         self,

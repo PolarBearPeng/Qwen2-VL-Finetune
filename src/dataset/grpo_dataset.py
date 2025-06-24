@@ -9,7 +9,26 @@ from torch.utils.data import Dataset
 from src.params import DataArguments
 from src.constants import SYSTEM_MESSAGE
 
-from .data_utils import llava_to_openai
+import re
+
+def replace_image_tokens(input_string, is_video=False):
+    pattern = r'\n?' + re.escape("<image>") + r'\n?' if not is_video else r'\n?' + re.escape("<video>") + r'\n?'
+
+    return re.sub(pattern, '', input_string)
+
+def llava_to_openai(conversations, is_video=False):
+    role_mapping = {"human": "user", "gpt": "assistant"}
+
+    transformed_data = []
+    for conversation in conversations:
+        transformed_content = replace_image_tokens(conversation["value"], is_video=is_video)
+        transformed_entry = {
+            "role": role_mapping.get(conversation["from"], conversation["from"]),
+            "content": transformed_content,
+        }
+        transformed_data.append(transformed_entry)
+
+    return transformed_data
 
 
 def get_image_content(image_path, min_pixel, max_pixel, width, height):
@@ -86,26 +105,24 @@ class GRPODataset(Dataset):
 
         is_video = False
 
+        contents = []
+
         if "image" in sources:
-            videos = None
 
             image_files = sources["image"]
             image_folder = self.data_args.image_folder
 
             if isinstance(image_files, str):
                 image_files = [image_files]
-
-            images = []
             
             for image_file in image_files:
                 if not os.path.exists(image_file):
                     if not image_file.startswith("http"):
                         image_file = os.path.join(image_folder, image_file)
-                images.append(get_image_content(image_file, self.image_min_pixel, self.image_max_pixel, self.image_resized_w, self.image_resized_h))
+                contents.append(get_image_content(image_file, self.image_min_pixel, self.image_max_pixel, self.image_resized_w, self.image_resized_h))
 
         elif "video" in sources:
             is_video = True
-            images=None
 
             video_files = sources["video"]
             video_folder = self.data_args.image_folder
@@ -113,15 +130,11 @@ class GRPODataset(Dataset):
             if isinstance(video_files, str):
                 video_files = [video_files]
 
-            videos = []
             for video_file in video_files:
                 if not os.path.exists(video_file):
                     if not video_file.startswith("http"):
                         video_file = os.path.join(video_folder, video_file)
-                videos.append(get_video_content(video_file, self.video_min_pixel, self.video_max_pixel, self.video_resized_w, self.video_resized_h, self.data_args.fps))
-        else:
-            images=None
-            videos=None
+                contents.append(get_video_content(video_file, self.video_min_pixel, self.video_max_pixel, self.video_resized_w, self.video_resized_h, self.data_args.fps))
 
         conversations = copy.deepcopy(llava_to_openai(sources['conversations'], is_video=is_video))
 
@@ -129,14 +142,8 @@ class GRPODataset(Dataset):
         gpt_response = conversations[1]
 
         text_content = {"type": "text", "text": user_input['content']}
-        contents = [text_content]
 
-        if images is not None:
-            for image in images:
-                contents.append(image)
-        elif videos is not None:
-            for video in videos:
-                contents.append(video)
+        contents.append(text_content)
 
         user_prompt = [{"role": "user", "content": contents}]
 
